@@ -1,0 +1,47 @@
+rules_version = '2';
+
+// ============================================================
+// 神旅帳 MVP - Cloud Storage セキュリティルール
+//
+// 保存先:
+//   goshuin/{uid}/{fileName}   御朱印の写真
+//   avatars/{uid}/{fileName}   プロフィール画像
+//
+// 方針:
+//   1. 本人のみ読み書き・削除できる（他人の御朱印は取得できない）
+//   2. 8MB 以下の画像（contentType が image/*）のみ受け付ける
+//   3. それ以外のパスは全拒否
+// ============================================================
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSelf(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function validImage() {
+      return request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    match /goshuin/{uid}/{fileName} {
+      allow get: if isSelf(uid);
+      // 一覧取得（list）は用途がないため許可しない
+      allow list: if false;
+      allow create, update: if isSelf(uid) && validImage();
+      allow delete: if isSelf(uid);
+    }
+
+    match /avatars/{uid}/{fileName} {
+      allow get: if isSelf(uid);
+      allow list: if false;
+      allow create, update: if isSelf(uid) && validImage();
+      allow delete: if isSelf(uid);
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

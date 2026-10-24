@@ -1,0 +1,142 @@
+rules_version = '2';
+
+// ============================================================
+// 神旅帳 MVP - Cloud Firestore セキュリティルール
+//
+// 方針:
+//   1. 本人のドキュメントのみ読み書きできる（users / visit_history / goshuin）
+//   2. 神社マスタ（shrines）は全員読み取り可・書き込み不可。
+//      例外としてチェックイン/削除に伴う visit_count の ±1 のみ本人に許可する
+//   3. 300m 以内という仕様はサーバー側でも強制する（distance_m <= 300）
+//   4. 未定義のコレクションは全拒否
+//
+// 注意（MVP の割り切り）:
+//   - App Check は未導入。導入後は request.auth.token と合わせて検証することを推奨
+//   - visit_count の集計は本来 Cloud Functions で行うのが望ましい
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // 文字列フィールドの最大長チェック
+    function maxLen(value, max) {
+      return value is string && value.size() <= max;
+    }
+
+    // ------------------------------------------------------------
+    // users/{uid}
+    // ------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+
+      allow create: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && maxLen(request.resource.data.nickname, 24)
+        && request.resource.data.nickname.size() > 0
+        && request.resource.data.photo_url is string
+        && request.resource.data.created_at is string
+        && request.resource.data.updated_at is string;
+
+      allow update: if isSelf(uid)
+        && request.resource.data.uid == uid
+        && maxLen(request.resource.data.nickname, 24)
+        && request.resource.data.nickname.size() > 0
+        && request.resource.data.photo_url is string;
+
+      // アカウント削除はサーバー側（Admin SDK）で行う
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------
+    // shrines/{shrineId}（マスタ。投入は Admin SDK / シードスクリプト）
+    // ------------------------------------------------------------
+    match /shrines/{shrineId} {
+      allow read: if true;
+
+      allow create, delete: if false;
+
+      // 訪問数の増減のみ許可（チェックイン時 +1 / 記録削除時 -1）
+      allow update: if signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visit_count'])
+        && request.resource.data.visit_count is int
+        && (request.resource.data.visit_count == resource.data.visit_count + 1
+            || request.resource.data.visit_count == resource.data.visit_count - 1);
+    }
+
+    // ------------------------------------------------------------
+    // visit_history/{visitId}（GPS チェックインの記録）
+    // ------------------------------------------------------------
+    match /visit_history/{visitId} {
+      allow read: if signedIn() && resource.data.user_id == request.auth.uid;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll([
+             'user_id', 'shrine_id', 'shrine_name', 'shrine_prefecture',
+             'visited_at', 'latitude', 'longitude', 'distance_m',
+           ])
+        && request.resource.data.user_id == request.auth.uid
+        && maxLen(request.resource.data.shrine_id, 64)
+        && maxLen(request.resource.data.shrine_name, 100)
+        && maxLen(request.resource.data.shrine_prefecture, 16)
+        && request.resource.data.visited_at is string
+        && request.resource.data.latitude is number
+        && request.resource.data.longitude is number
+        && request.resource.data.latitude >= -90
+        && request.resource.data.latitude <= 90
+        && request.resource.data.longitude >= -180
+        && request.resource.data.longitude <= 180
+        && request.resource.data.distance_m is number
+        && request.resource.data.distance_m >= 0
+        && request.resource.data.distance_m <= 300;  // 神社から300m以内のみ
+
+      // 記録の改ざんは許可しない（削除して再登録する）
+      allow update: if false;
+
+      allow delete: if signedIn() && resource.data.user_id == request.auth.uid;
+    }
+
+    // ------------------------------------------------------------
+    // goshuin/{goshuinId}（御朱印帳）
+    // ------------------------------------------------------------
+    match /goshuin/{goshuinId} {
+      allow read: if signedIn() && resource.data.user_id == request.auth.uid;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll([
+             'user_id', 'shrine_id', 'shrine_name', 'photo_url', 'visited_date', 'created_at',
+           ])
+        && request.resource.data.user_id == request.auth.uid
+        && maxLen(request.resource.data.shrine_id, 64)
+        && maxLen(request.resource.data.shrine_name, 100)
+        && request.resource.data.photo_url is string
+        && request.resource.data.photo_url.size() > 0
+        && request.resource.data.photo_url.size() <= 2048
+        && maxLen(request.resource.data.visited_date, 10)
+        && request.resource.data.visited_date.matches('^\\\\d{4}-\\\\d{2}-\\\\d{2}$')
+        && maxLen(request.resource.data.memo, 300)
+        && request.resource.data.created_at is string;
+
+      allow update: if signedIn()
+        && resource.data.user_id == request.auth.uid
+        && request.resource.data.user_id == request.auth.uid
+        && maxLen(request.resource.data.memo, 300);
+
+      allow delete: if signedIn() && resource.data.user_id == request.auth.uid;
+    }
+
+    // ------------------------------------------------------------
+    // 上記以外はすべて拒否
+    // ------------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
